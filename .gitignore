@@ -1,29 +1,6 @@
-# Python cache
 __pycache__/
-*.pyc
-*.pyo
-
-# Virtual environment
-.venv/
-venv/
-env/
-
-# Downloads (yt-dlp audio files)
 downloads/
-
-# Database
 bot.db
-
-# Environment variables
 .env
-
-# Logs
-*.log
-
-# Replit specific
 .replit
 replit.nix
-
-# OS files
-.DS_Store
-Thumbs.db
