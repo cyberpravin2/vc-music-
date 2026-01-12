@@ -1,173 +1,247 @@
-import os, asyncio, sqlite3, yt_dlp
+import os
+import asyncio
+import sqlite3
 from pyrogram import Client, filters
-from pyrogram.enums import ChatMemberStatus
 from pytgcalls import PyTgCalls
-from pytgcalls.types.input_stream import AudioPiped
+from pytgcalls.types import MediaStream
+import yt_dlp
 
 # ================= CONFIG =================
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID"))
-SKIP_VOTE_PERCENT = int(os.getenv("SKIP_VOTE_PERCENT", "60"))
-FORCE_VOTE_PERCENT = int(os.getenv("FORCE_VOTE_PERCENT", "60"))
+OWNER_ID = int(os.getenv("OWNER_ID"))  # bot owner (super admin)
 
-DOWNLOAD_DIR = "downloads"
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+if not all([API_ID, API_HASH, BOT_TOKEN, OWNER_ID]):
+    print("❌ Missing ENV variables")
+    exit(1)
 
-# ================= INIT =================
-app = Client("vc_music_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+# ================= CLIENT =================
+app = Client(
+    "vc-music-bot",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+)
 call = PyTgCalls(app)
 
-queues = {}      # {chat_id: [(file, title)]}
-paused = set()   # paused chat_ids
-votes = {}       # {chat_id: {"skip": set(), "force": set()}}
+# ================= STORAGE =================
+queues = {}      # chat_id -> [(file, title)]
+paused = set()
+users = set()
 
-# ================= DB =================
+# ================= DATABASE =================
 db = sqlite3.connect("bot.db", check_same_thread=False)
 cur = db.cursor()
-cur.execute("CREATE TABLE IF NOT EXISTS group_admins (chat_id INTEGER, user_id INTEGER)")
+cur.execute("""
+CREATE TABLE IF NOT EXISTS group_admins (
+    chat_id INTEGER,
+    user_id INTEGER
+)
+""")
 db.commit()
 
-def add_admin(chat_id, user_id):
-    cur.execute("INSERT INTO group_admins VALUES (?,?)", (chat_id, user_id))
+def add_group_admin(chat_id, user_id):
+    cur.execute(
+        "INSERT INTO group_admins (chat_id, user_id) VALUES (?, ?)",
+        (chat_id, user_id),
+    )
     db.commit()
 
-def del_admin(chat_id, user_id):
-    cur.execute("DELETE FROM group_admins WHERE chat_id=? AND user_id=?", (chat_id, user_id))
+def remove_group_admin(chat_id, user_id):
+    cur.execute(
+        "DELETE FROM group_admins WHERE chat_id=? AND user_id=?",
+        (chat_id, user_id),
+    )
     db.commit()
 
-def get_admins(chat_id):
-    cur.execute("SELECT user_id FROM group_admins WHERE chat_id=?", (chat_id,))
-    return {r[0] for r in cur.fetchall()}
+def get_group_admins(chat_id):
+    cur.execute(
+        "SELECT user_id FROM group_admins WHERE chat_id=?",
+        (chat_id,),
+    )
+    return {row[0] for row in cur.fetchall()}
 
 # ================= HELPERS =================
-def is_owner(uid): return uid == OWNER_ID
+def is_owner(uid: int) -> bool:
+    return uid == OWNER_ID
 
-async def is_group_admin(client, chat_id, uid):
-    if is_owner(uid): return True
-    if uid in get_admins(chat_id): return True
-    m = await client.get_chat_member(chat_id, uid)
-    return m.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+def is_group_admin(chat_id: int, uid: int) -> bool:
+    if uid == OWNER_ID:
+        return True
+    return uid in get_group_admins(chat_id)
 
-def need_votes(chat_id, percent):
-    members = max(3, len(votes.get(chat_id, {}).get("members", set())))
-    return max(2, members * percent // 100)
+def is_global_admin(uid: int) -> bool:
+    return uid == OWNER_ID
 
-def download_audio(q):
-    ydl_opts = {"format":"bestaudio","outtmpl":f"{DOWNLOAD_DIR}/%(id)s.%(ext)s","quiet":True}
+# ================= YTDLP =================
+os.makedirs("downloads", exist_ok=True)
+ydl_opts = {
+    "format": "bestaudio/best",
+    "outtmpl": "downloads/%(id)s.%(ext)s",
+    "quiet": True,
+}
+
+def download_song(song):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(f"ytsearch1:{q}", download=True)
+        info = ydl.extract_info(f"ytsearch1:{song}", download=True)
         v = info["entries"][0]
-        for e in ["mp3","m4a","webm","opus"]:
-            p = f"{DOWNLOAD_DIR}/{v['id']}.{e}"
-            if os.path.exists(p): return p, v["title"]
-    raise Exception("download failed")
+        return f"downloads/{v['id']}.webm", v["title"]
 
-async def play_next(chat_id):
-    if not queues.get(chat_id):
-        await call.leave_group_call(chat_id)
-        return
-    f,_ = queues[chat_id].pop(0)
-    await call.change_stream(chat_id, AudioPiped(f))
-
-# ================= MUSIC =================
+# ================= MUSIC COMMANDS (PUBLIC) =================
 @app.on_message(filters.command("play") & filters.group)
 async def play(_, m):
+    users.add(m.from_user.id)
+
+    if len(m.command) < 2:
+        return await m.reply("Use: /play song name")
+
     q = " ".join(m.command[1:])
-    if not q: return await m.reply("Use: /play song")
-    f,t = download_audio(q)
-    queues.setdefault(m.chat.id, []).append((f,t))
-    votes[m.chat.id] = {"skip":set(),"force":set(),"members":set()}
+    msg = await m.reply("🔍 Downloading...")
+
+    try:
+        file, title = await asyncio.get_event_loop().run_in_executor(
+            None, download_song, q
+        )
+    except:
+        return await msg.edit("❌ Song nahi mila")
+
+    queues.setdefault(m.chat.id, []).append((file, title))
+
     if len(queues[m.chat.id]) == 1:
-        await call.join_group_call(m.chat.id, AudioPiped(f))
-        await m.reply(f"🎵 Now Playing: {t}")
+        await call.play(m.chat.id, MediaStream(file, audio_only=True))
+        await msg.edit(f"🎵 Now Playing:\n{title}")
     else:
-        await m.reply(f"➕ Queued: {t}")
+        await msg.edit(f"➕ Queued:\n{title}")
+
+@app.on_message(filters.command("forceplay") & filters.group)
+async def forceplay(_, m):
+    users.add(m.from_user.id)
+
+    if len(m.command) < 2:
+        return await m.reply("Use: /forceplay song name")
+
+    q = " ".join(m.command[1:])
+    msg = await m.reply("🔥 Force playing...")
+
+    try:
+        file, title = await asyncio.get_event_loop().run_in_executor(
+            None, download_song, q
+        )
+    except:
+        return await msg.edit("❌ Song nahi mila")
+
+    queues[m.chat.id] = [(file, title)]
+    await call.play(m.chat.id, MediaStream(file, audio_only=True))
+    await msg.edit(f"🔥 Force Playing:\n{title}")
 
 @app.on_message(filters.command("pause") & filters.group)
 async def pause(_, m):
-    if m.chat.id not in paused:
-        paused.add(m.chat.id)
-        await call.pause_stream(m.chat.id)
-        await m.reply("⏸ Paused")
+    await call.pause(m.chat.id)
+    paused.add(m.chat.id)
+    await m.reply("⏸ Paused")
 
 @app.on_message(filters.command("resume") & filters.group)
 async def resume(_, m):
-    if m.chat.id in paused:
-        paused.remove(m.chat.id)
-        await call.resume_stream(m.chat.id)
-        await m.reply("▶️ Resumed")
+    await call.resume(m.chat.id)
+    paused.discard(m.chat.id)
+    await m.reply("▶️ Resumed")
 
 @app.on_message(filters.command("skip") & filters.group)
 async def skip(_, m):
-    if await is_group_admin(app, m.chat.id, m.from_user.id):
-        await play_next(m.chat.id)
-        return await m.reply("⏭ Skipped by admin")
+    if not queues.get(m.chat.id):
+        return await m.reply("❌ Queue empty")
 
-    v = votes.setdefault(m.chat.id, {"skip":set(),"force":set(),"members":set()})
-    v["skip"].add(m.from_user.id)
-    v["members"].add(m.from_user.id)
-    if len(v["skip"]) >= need_votes(m.chat.id, SKIP_VOTE_PERCENT):
-        await play_next(m.chat.id)
-        await m.reply("⏭ Skip vote passed")
-    else:
-        await m.reply("🗳 Skip vote added")
+    queues[m.chat.id].pop(0)
 
-@app.on_message(filters.command("forceplay") & filters.group)
-async def force(_, m):
-    q = " ".join(m.command[1:])
-    if not q: return await m.reply("Use: /forceplay song")
-    f,t = download_audio(q)
+    if not queues[m.chat.id]:
+        await call.leave_call(m.chat.id)
+        return await m.reply("🛑 Music ended")
 
-    if await is_group_admin(app, m.chat.id, m.from_user.id):
-        queues[m.chat.id] = [(f,t)]
-        await call.change_stream(m.chat.id, AudioPiped(f))
-        return await m.reply(f"🔥 Force play by admin: {t}")
-
-    v = votes.setdefault(m.chat.id, {"skip":set(),"force":set(),"members":set()})
-    v["force"].add(m.from_user.id)
-    v["members"].add(m.from_user.id)
-    if len(v["force"]) >= need_votes(m.chat.id, FORCE_VOTE_PERCENT):
-        queues[m.chat.id] = [(f,t)]
-        await call.change_stream(m.chat.id, AudioPiped(f))
-        await m.reply("🔥 Force play vote passed")
-    else:
-        await m.reply("🗳 Force vote added")
+    file, title = queues[m.chat.id][0]
+    await call.play(m.chat.id, MediaStream(file, audio_only=True))
+    await m.reply(f"⏭ Skipped\nNow Playing:\n{title}")
 
 @app.on_message(filters.command("stop") & filters.group)
 async def stop(_, m):
     queues.pop(m.chat.id, None)
-    await call.leave_group_call(m.chat.id)
-    await m.reply("🛑 VC stopped")
+    await call.leave_call(m.chat.id)
+    await m.reply("🛑 Music stopped")
 
 @app.on_message(filters.command("queue") & filters.group)
-async def qlist(_, m):
-    q = queues.get(m.chat.id, [])
-    if not q: return await m.reply("Queue empty")
-    txt="Queue:\n"+"\n".join(f"{i+1}. {t}" for i,(_,t) in enumerate(q))
-    await m.reply(txt)
+async def queue(_, m):
+    if not queues.get(m.chat.id):
+        return await m.reply("📭 Queue empty")
 
-# ================= ADMINS =================
+    text = "📜 Queue:\n\n"
+    for i, (_, title) in enumerate(queues[m.chat.id], 1):
+        text += f"{i}. {title}\n"
+
+    await m.reply(text)
+
+# ================= PER-GROUP ADMIN COMMANDS =================
 @app.on_message(filters.command("addadmin") & filters.group)
-async def addadm(_, m):
-    if not is_owner(m.from_user.id): return
-    if not m.reply_to_message: return await m.reply("Reply user + /addadmin")
-    add_admin(m.chat.id, m.reply_to_message.from_user.id)
+async def addadmin(_, m):
+    if not is_owner(m.from_user.id):
+        return await m.reply("❌ Sirf owner admin add kar sakta hai")
+
+    if not m.reply_to_message:
+        return await m.reply("Reply user + /addadmin")
+
+    uid = m.reply_to_message.from_user.id
+    add_group_admin(m.chat.id, uid)
     await m.reply("✅ Group admin added")
 
 @app.on_message(filters.command("deladmin") & filters.group)
-async def deladm(_, m):
-    if not is_owner(m.from_user.id): return
-    if not m.reply_to_message: return await m.reply("Reply user + /deladmin")
-    del_admin(m.chat.id, m.reply_to_message.from_user.id)
+async def deladmin(_, m):
+    if not is_owner(m.from_user.id):
+        return await m.reply("❌ Sirf owner admin remove kar sakta hai")
+
+    if not m.reply_to_message:
+        return await m.reply("Reply user + /deladmin")
+
+    uid = m.reply_to_message.from_user.id
+    remove_group_admin(m.chat.id, uid)
     await m.reply("❌ Group admin removed")
+
+# ================= GLOBAL ADMIN =================
+@app.on_message(filters.command("broadcast") & filters.private)
+async def broadcast(_, m):
+    if not is_global_admin(m.from_user.id):
+        return await m.reply("❌ Owner only")
+
+    if len(m.command) < 2:
+        return await m.reply("Use: /broadcast message")
+
+    text = " ".join(m.command[1:])
+    sent = 0
+
+    for uid in users:
+        try:
+            await app.send_message(uid, f"📢 {text}")
+            sent += 1
+        except:
+            pass
+
+    await m.reply(f"✅ Broadcast sent to {sent} users")
+
+@app.on_message(filters.command("status") & filters.private)
+async def status(_, m):
+    if not is_global_admin(m.from_user.id):
+        return await m.reply("❌ Owner only")
+
+    await m.reply(
+        f"📊 Bot Status\n\n"
+        f"👥 Users: {len(users)}\n"
+        f"🎧 Active VC: {len(queues)}"
+    )
 
 # ================= START =================
 async def main():
     await app.start()
     await call.start()
-    print("VC MUSIC BOT ULTIMATE RUNNING")
+    print("✅ VC Music Bot Running (Per-Group Admin Enabled)")
     await asyncio.Event().wait()
 
-asyncio.run(main())
+if __name__ == "__main__":
+    asyncio.run(main())
